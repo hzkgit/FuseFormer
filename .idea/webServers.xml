@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="f0b04e41-47ea-4217-85e9-d51b040c6a3e" name="FuseFormer" url="http:///">
+        <fileTransfer accessType="SFTP" host="connect.westb.seetacloud.com" port="32474" sshConfigId="13e68f09-cdf2-4813-b2df-f38ee38b5112" sshConfig="FuseFormer-Terminal" />
+      </webServer>
+    </option>
+  </component>
+</project>
