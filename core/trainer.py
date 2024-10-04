@@ -25,19 +25,19 @@ class Trainer():
         self.epoch = 0
         self.iteration = 0
 
-        # setup data set and data loader
+        # setup data set and data loader DataLoader通过调用Dataset的__getitem__方法来获取数据
         self.train_dataset = Dataset(config['data_loader'], split='train')
-        self.train_sampler = None
+        self.train_sampler = None  # 默认使用SequentialSampler
         self.train_args = config['trainer']
         if config['distributed']:
-            self.train_sampler = DistributedSampler(
+            self.train_sampler = DistributedSampler(  # 如果是分布式训练则使用DistributedSampler
                 self.train_dataset,
                 num_replicas=config['world_size'], 
                 rank=config['global_rank'])
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.train_args['batch_size'] // config['world_size'],
-            shuffle=(self.train_sampler is None), 
+            shuffle=(self.train_sampler is None),  # 如果train_sampler为空则随机采样，即使用RandomSampler
             num_workers=self.train_args['num_workers'], 
             sampler=self.train_sampler)
 
@@ -215,58 +215,64 @@ class Trainer():
             self.adjust_learning_rate()
             self.iteration += 1
 
-            frames, masks = frames.to(device), masks.to(device)
+            frames, masks = frames.to(device), masks.to(device)  # frames(8,2,3,240,432) masks(8,2,1,240,432)
             b, t, c, h, w = frames.size()
-            masked_frame = (frames * (1 - masks).float())
+            masked_frame = (frames * (1 - masks).float())  # masked_frame：保留原帧中可见区域，不可见区域全部设为0
             pred_img = self.netG(masked_frame)  # 输入数据到模型
-            frames = frames.view(b*t, c, h, w)
+            frames = frames.view(b*t, c, h, w)  # (16,3,240,432)
             masks = masks.view(b*t, 1, h, w)
-            comp_img = frames*(1.-masks) + masks*pred_img
+            comp_img = frames*(1.-masks) + masks*pred_img  # frames*(1.-masks)：取原帧中可见部分  masks*pred_img：取预测图中的不可见部分
 
             gen_loss = 0
             dis_loss = 0
 
             if not self.config['model']['no_dis']:
-                # discriminator adversarial loss
-                real_vid_feat = self.netD(frames)
-                fake_vid_feat = self.netD(comp_img.detach())
+                # discriminator adversarial loss  进入判别器网络
+                real_vid_feat = self.netD(frames)  # 先将原图通过判别器 real_vid_feat=([1, 16, 128, 4, 7])
+                fake_vid_feat = self.netD(comp_img.detach())  # 再将合成后的图通过判别器 fake_vid_feat=([1, 16, 128, 4, 7])
                 dis_real_loss = self.adversarial_loss(real_vid_feat, True, True)
                 dis_fake_loss = self.adversarial_loss(fake_vid_feat, False, True)
                 dis_loss += (dis_real_loss + dis_fake_loss) / 2
                 self.add_summary(
-                    self.dis_writer, 'loss/dis_vid_fake', dis_fake_loss.item())
+                    self.dis_writer, 'loss/dis_vid_fake', dis_fake_loss.item())  # 记录损失值到文件，保存位置：checkpoints下
                 self.add_summary(
                     self.dis_writer, 'loss/dis_vid_real', dis_real_loss.item())
+                # self.optimD.zero_grad():将优化器中存储的所有参数的梯度缓存重置为零。在深度学习模型中，每次前向传播之后，都需要执行反向传播来计算梯度。
+                # 这些梯度随后将用于更新模型的参数（权重和偏置）。如果不显式地清除旧的梯度，新的梯度将会累加上次的计算结果，导致错误的累积效应。
                 self.optimD.zero_grad()
+                # 计算损失张量dis_loss相对于模型中所有带有requires_grad=True属性的参数的梯度,这些梯度将被存储在参数的.grad属性中，并用于后续的参数更新步骤
                 dis_loss.backward()
+                # 用于执行优化器的参数更新步骤 在训练模型时，一旦计算出损失的梯度（通过loss.backward()），接下来就需要使用优化器来更新模型的参数，以最小化损失函数
+                # 当调用self.optimD.step()时,优化器会根据存储在模型参数梯度（.grad属性）中的信息来更新这些参数
+                # 注意：这里的优化器只更新判别器网络 ，因为定义时只传入了netD的参数，self.optimD = torch.optim.Adam(self.netD.parameters(), ...)
                 self.optimD.step()
 
                 # generator adversarial loss
-                gen_vid_feat = self.netD(comp_img)
+                gen_vid_feat = self.netD(comp_img)  # 将合成图输入生成器
                 gan_loss = self.adversarial_loss(gen_vid_feat, True, False)
                 gan_loss = gan_loss * self.config['losses']['adversarial_weight']
-                gen_loss += gan_loss
+                gen_loss += gan_loss  # 生成器损失值
                 self.add_summary(
                     self.gen_writer, 'loss/gan_loss', gan_loss.item())
 
             # generator l1 loss
-            hole_loss = self.l1_loss(pred_img*masks, frames*masks)
+            hole_loss = self.l1_loss(pred_img*masks, frames*masks)  # 将“预测出的不可见部分”与“原图中真实部分”计算L1损失
             hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
-            gen_loss += hole_loss 
+            gen_loss += hole_loss  # 预测结果与真实结果间的损失值
             self.add_summary(
                 self.gen_writer, 'loss/hole_loss', hole_loss.item())
 
-            valid_loss = self.l1_loss(pred_img*(1-masks), frames*(1-masks))
+            valid_loss = self.l1_loss(pred_img*(1-masks), frames*(1-masks))  # 将“预测出的可见部分”与“原图中真实部分”计算L1损失
             valid_loss = valid_loss / torch.mean(1-masks) * self.config['losses']['valid_weight']
-            gen_loss += valid_loss 
+            gen_loss += valid_loss  # 预测结果（可见部分）与真实结果间的损失值
             self.add_summary(
                 self.gen_writer, 'loss/valid_loss', valid_loss.item())
             
             self.optimG.zero_grad()
             gen_loss.backward()
-            self.optimG.step()
+            self.optimG.step()  # 更新生成器的参数
 
-            # console logs
+            # console logs 输出日志
             if self.config['global_rank'] == 0:
                 pbar.update(1)
                 if not self.config['model']['no_dis']:
@@ -284,7 +290,7 @@ class Trainer():
                         logging.info('[Iter {}] d: {:.4f}; g: {:.4f}; hole: {:.4f}; valid: {:.4f}'.format(self.iteration, dis_loss.item(), gan_loss.item(), hole_loss.item(), valid_loss.item()))
                     else:
                         logging.info('[Iter {}] hole: {:.4f}; valid: {:.4f}'.format(self.iteration, hole_loss.item(), valid_loss.item()))
-            # saving models
+            # saving models 保存模型参数
             if self.iteration % self.train_args['save_freq'] == 0:
                 self.save(int(self.iteration//self.train_args['save_freq']))
             if self.iteration > self.train_args['iterations']:

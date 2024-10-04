@@ -84,32 +84,32 @@ class ToTorchFormatTensor(object):
 
 def create_random_shape_with_random_motion(video_length, imageHeight=240, imageWidth=432):
     # get a random shape
-    height = random.randint(imageHeight//3, imageHeight-1)
-    width = random.randint(imageWidth//3, imageWidth-1)
-    edge_num = random.randint(6, 8)
-    ratio = random.randint(6, 8)/10
-    region = get_random_shape(
+    height = random.randint(imageHeight//3, imageHeight-1)  # height的范围被限制在原图像高度的1/3到图像高度减1之间
+    width = random.randint(imageWidth//3, imageWidth-1)  # 同上
+    edge_num = random.randint(6, 8)  # 随机形状的边数，取值范围在6到8之间
+    ratio = random.randint(6, 8)/10  # 随机的比率ratio，用于控制多边形顶点的随机性或形状的复杂度
+    region = get_random_shape(  # 根据给定的参数生成一个随机形状区域
         edge_num=edge_num, ratio=ratio, height=height, width=width)
     region_width, region_height = region.size
     # get random position
     x, y = random.randint(
         0, imageHeight-region_height), random.randint(0, imageWidth-region_width)
-    velocity = get_random_velocity(max_speed=3)
-    m = Image.fromarray(np.zeros((imageHeight, imageWidth)).astype(np.uint8))
-    m.paste(region, (y, x, y+region.size[0], x+region.size[1]))
-    masks = [m.convert('L')]
+    velocity = get_random_velocity(max_speed=3)  # 返回一个随机速度
+    m = Image.fromarray(np.zeros((imageHeight, imageWidth)).astype(np.uint8))  # 创建了一个与原始图像大小相同的全零数组
+    m.paste(region, (y, x, y+region.size[0], x+region.size[1]))  # 将之前生成的形状区域region粘贴到掩码图像m上。粘贴的位置由(y, x)坐标确定
+    masks = [m.convert('L')]  # 将掩码图像m转换为灰度图像（单通道），并存储到列表masks中
     # return fixed masks
-    if random.uniform(0, 1) > 0.5:
+    if random.uniform(0, 1) > 0.5:  # 决定是否对视频的每一帧应用相同的掩码
         return masks*video_length
     # return moving masks
     for _ in range(video_length-1):
-        x, y, velocity = random_move_control_points(
+        x, y, velocity = random_move_control_points(  # 更新形状的位置和速度
             x, y, imageHeight, imageWidth, velocity, region.size, maxLineAcceleration=(3, 0.5), maxInitSpeed=3)
         m = Image.fromarray(
-            np.zeros((imageHeight, imageWidth)).astype(np.uint8))
-        m.paste(region, (y, x, y+region.size[0], x+region.size[1]))
+            np.zeros((imageHeight, imageWidth)).astype(np.uint8))  # 创建了一个与原始图像大小相同的全零数组
+        m.paste(region, (y, x, y+region.size[0], x+region.size[1]))  # 将生成的形状区域region粘贴到掩码图像m新的位置上
         masks.append(m.convert('L'))
-    return masks
+    return masks  # 包含了形状从初始位置随机移动到结束的整个过程的遮罩图像序列
 
 
 def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):

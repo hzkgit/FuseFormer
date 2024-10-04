@@ -67,7 +67,7 @@ if __name__ == "__main__":
     # setup distributed parallel training environments
     if get_master_ip() == "127.0.0.1":
         # manually launch distributed processes 
-        mp.spawn(main_worker, nprocs=config['world_size'], args=(config,))
+        mp.spawn(main_worker, nprocs=config['world_size'], args=(config,))  # 启动config['world_size']个子进程
     else:
         # multiple processes have been launched by openmpi 
         config['local_rank'] = get_local_rank()
