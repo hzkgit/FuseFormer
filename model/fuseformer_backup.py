@@ -10,8 +10,6 @@ import torch.nn.functional as F
 import torchvision.models as models
 from core.spectral_norm import spectral_norm as _spectral_norm
 import matplotlib.pyplot as plt
-from torch import Tensor, LongTensor
-from typing import Tuple, Optional
 
 
 def visualize_img(tensor, savename):
@@ -144,259 +142,6 @@ class Encoder(nn.Module):
         return out
 
 
-class DWConv(nn.Module):
-    def __init__(self, dim=768):
-        super(DWConv, self).__init__()
-        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
-
-    def forward(self, x):
-        """
-        x: NHWC tensor
-        """
-        x = x.permute(0, 3, 1, 2)  # NCHW
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)  # NHWC
-
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, dim,
-                 num_heads=8, n_win=7, qk_dim=None, qk_scale=None,
-                 topk=4,
-                 mlp_ratio=4, mlp_dwconv=False,
-                 side_dwconv=5, before_attn_dwconv=3, pre_norm=True, auto_pad=False):
-        super().__init__()
-        qk_dim = qk_dim or dim
-
-        # modules
-        if before_attn_dwconv > 0:
-            self.pos_embed = nn.Conv2d(dim, dim, kernel_size=before_attn_dwconv, padding=1, groups=dim)
-        else:
-            self.pos_embed = lambda x: 0
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)  # important to avoid attention collapsing
-        if topk > 0:
-            self.attn = BiLevelRoutingAttention_nchw(dim=dim, num_heads=num_heads, n_win=n_win,
-                                                     qk_scale=qk_scale,
-                                                     topk=topk,
-                                                     side_dwconv=side_dwconv,
-                                                     auto_pad=auto_pad)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = nn.Sequential(nn.Linear(dim, int(mlp_ratio * dim)),
-                                 DWConv(int(mlp_ratio * dim)) if mlp_dwconv else nn.Identity(),
-                                 nn.GELU(),
-                                 nn.Linear(int(mlp_ratio * dim), dim)
-                                 )
-        self.use_layer_scale = False
-        self.pre_norm = pre_norm
-
-    def forward(self, x):
-        """
-        x: NCHW tensor
-        """
-        # conv pos embedding
-        x = x + self.pos_embed(x)  # 注意力0层,(16,64,56,56)+(16,64,56,56)=>(16,64,56,56)
-        # permute to NHWC tensor for attention & mlp
-        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
-        x = x + self.attn(self.norm1(x))  # (N, H, W, C)
-        x = x + self.mlp(self.norm2(x))  # (N, H, W, C)  # 输入x:(16,56,56,64) 经过一次层归一化、经过一个2层全连接得到x:(16,56,56,64)
-        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)  # =>(16,64,56,56)
-        return x
-
-
-def _grid2seq(x: Tensor, region_size: Tuple[int], num_heads: int):
-    """
-    Args:
-        x: BCHW tensor
-        region size: int
-        num_heads: number of attention heads
-    Return:
-        out: rearranged x, has a shape of (bs, nhead, nregion, reg_size, head_dim)
-        region_h, region_w: number of regions per col/row
-    """
-    B, C, H, W = x.size()
-    region_h, region_w = H // region_size[0], W // region_size[1]
-    x = x.view(B, num_heads, C // num_heads, region_h, region_size[0], region_w, region_size[1])
-    x = torch.einsum('bmdhpwq->bmhwpqd', x).flatten(2, 3).flatten(-3, -2)  # (bs, nhead, nregion, reg_size, head_dim)
-    return x, region_h, region_w
-
-
-def _seq2grid(x: Tensor, region_h: int, region_w: int, region_size: Tuple[int]):
-    """
-    Args:
-        x: (bs, nhead, nregion, reg_size^2, head_dim)
-    Return:
-        x: (bs, C, H, W)
-    """
-    bs, nhead, nregion, reg_size_square, head_dim = x.size()
-    x = x.view(bs, nhead, region_h, region_w, region_size[0], region_size[1], head_dim)
-    x = torch.einsum('bmhwpqd->bmdhpwq', x).reshape(bs, nhead * head_dim,
-                                                    region_h * region_size[0], region_w * region_size[1])
-    return x
-
-
-def regional_routing_attention_torch(
-        query: Tensor, key: Tensor, value: Tensor, scale: float,
-        region_graph: LongTensor, region_size: Tuple[int],
-        kv_region_size: Optional[Tuple[int]] = None,
-        auto_pad=True) -> Tensor:
-    """
-    Args:
-        query, key, value: (B, C, H, W) tensor
-        scale: the scale/temperature for dot product attention
-        region_graph: (B, nhead, h_q*w_q, topk) tensor, topk <= h_k*w_k
-        region_size: region/window size for queries, (rh, rw)
-        key_region_size: optional, if None, key_region_size=region_size
-        auto_pad: required to be true if the input sizes are not divisible by the region_size
-    Return:
-        output: (B, C, H, W) tensor
-        attn: (bs, nhead, q_nregion, reg_size, topk*kv_region_size) attention matrix
-    """
-    kv_region_size = kv_region_size or region_size
-    bs, nhead, q_nregion, topk = region_graph.size()
-
-    # Auto pad to deal with any input size
-    q_pad_b, q_pad_r, kv_pad_b, kv_pad_r = 0, 0, 0, 0
-    if auto_pad:
-        _, _, Hq, Wq = query.size()
-        q_pad_b = (region_size[0] - Hq % region_size[0]) % region_size[0]
-        q_pad_r = (region_size[1] - Wq % region_size[1]) % region_size[1]
-        if (q_pad_b > 0 or q_pad_r > 0):
-            query = F.pad(query, (0, q_pad_r, 0, q_pad_b))  # zero padding
-
-        _, _, Hk, Wk = key.size()
-        kv_pad_b = (kv_region_size[0] - Hk % kv_region_size[0]) % kv_region_size[0]
-        kv_pad_r = (kv_region_size[1] - Wk % kv_region_size[1]) % kv_region_size[1]
-        if (kv_pad_r > 0 or kv_pad_b > 0):
-            key = F.pad(key, (0, kv_pad_r, 0, kv_pad_b))  # zero padding
-            value = F.pad(value, (0, kv_pad_r, 0, kv_pad_b))  # zero padding
-
-    # to sequence format, i.e. (bs, nhead, nregion, reg_size, head_dim)
-    query, q_region_h, q_region_w = _grid2seq(query, region_size=region_size, num_heads=nhead)
-    key, _, _ = _grid2seq(key, region_size=kv_region_size, num_heads=nhead)
-    value, _, _ = _grid2seq(value, region_size=kv_region_size, num_heads=nhead)
-
-    # gather key and values.
-    # TODO: is seperate gathering slower than fused one (our old version) ?
-    # torch.gather does not support broadcasting, hence we do it manually
-    bs, nhead, kv_nregion, kv_region_size, head_dim = key.size()
-    broadcasted_region_graph = region_graph.view(bs, nhead, q_nregion, topk, 1, 1). \
-        expand(-1, -1, -1, -1, kv_region_size, head_dim)
-    key_g = torch.gather(key.view(bs, nhead, 1, kv_nregion, kv_region_size, head_dim). \
-                         expand(-1, -1, query.size(2), -1, -1, -1), dim=3,
-                         index=broadcasted_region_graph)  # (bs, nhead, q_nregion, topk, kv_region_size, head_dim)
-    value_g = torch.gather(value.view(bs, nhead, 1, kv_nregion, kv_region_size, head_dim). \
-                           expand(-1, -1, query.size(2), -1, -1, -1), dim=3,
-                           index=broadcasted_region_graph)  # (bs, nhead, q_nregion, topk, kv_region_size, head_dim)
-
-    # token-to-token attention
-    # (bs, nhead, q_nregion, reg_size, head_dim) @ (bs, nhead, q_nregion, head_dim, topk*kv_region_size)
-    # -> (bs, nhead, q_nregion, reg_size, topk*kv_region_size)
-    # TODO: mask padding region
-    attn = (query * scale) @ key_g.flatten(-3, -2).transpose(-1, -2)
-    attn = torch.softmax(attn, dim=-1)
-    # (bs, nhead, q_nregion, reg_size, topk*kv_region_size) @ (bs, nhead, q_nregion, topk*kv_region_size, head_dim)
-    # -> (bs, nhead, q_nregion, reg_size, head_dim)
-    output = attn @ value_g.flatten(-3, -2)
-
-    # to BCHW format
-    output = _seq2grid(output, region_h=q_region_h, region_w=q_region_w, region_size=region_size)
-
-    # remove paddings if needed
-    if auto_pad and (q_pad_b > 0 or q_pad_r > 0):
-        output = output[:, :, :Hq, :Wq]
-
-    return output, attn
-
-
-class BiLevelRoutingAttention_nchw(nn.Module):
-    """Bi-Level Routing Attention that takes nchw input
-
-    Compared to legacy version, this implementation:
-    * removes unused args and components
-    * uses nchw input format to avoid frequent permutation
-
-    When the size of inputs is not divisible by the region size, there is also a numerical difference
-    than legacy implementation, due to:
-    * different way to pad the input feature map (padding after linear projection)
-    * different pooling behavior (count_include_pad=False)
-
-    Current implementation is more reasonable, hence we do not keep backward numerical compatiability
-    """
-
-    def __init__(self, dim, num_heads=8, n_win=7, qk_scale=None, topk=4, side_dwconv=3, auto_pad=False,
-                 attn_backend='torch'):
-        super().__init__()
-        # local attention setting
-        self.dim = dim
-        self.num_heads = num_heads
-        assert self.dim % num_heads == 0, 'dim must be divisible by num_heads!'
-        self.head_dim = self.dim // self.num_heads
-        self.scale = qk_scale or self.dim ** -0.5  # NOTE: to be consistent with old models.
-
-        ################side_dwconv (i.e. LCE in Shunted Transformer)###########
-        self.lepe = nn.Conv2d(dim, dim, kernel_size=side_dwconv, stride=1, padding=side_dwconv // 2,
-                              groups=dim) if side_dwconv > 0 else \
-            lambda x: torch.zeros_like(x)
-
-        ################ regional routing setting #################
-        self.topk = topk
-        self.n_win = n_win  # number of windows per row/col
-
-        ##########################################
-
-        self.qkv_linear = nn.Conv2d(self.dim, 3 * self.dim, kernel_size=1)
-        self.output_linear = nn.Conv2d(self.dim, self.dim, kernel_size=1)
-
-        if attn_backend == 'torch':
-            self.attn_fn = regional_routing_attention_torch
-        else:
-            raise ValueError('CUDA implementation is not available yet. Please stay tuned.')
-
-    def forward(self, x: Tensor, ret_attn_mask=False):
-        """
-        Args:
-            x: NCHW tensor, better to be channel_last (https://pytorch.org/tutorials/intermediate/memory_format_tutorial.html)
-        Return:
-            NCHW tensor
-        """
-        N, T, C, H, W = x.size()
-        region_size = (H // self.n_win, W // self.n_win)  # (64/7,64/7)=(9,9)
-
-        # STEP 1: linear projection
-        x_flattened = x.view(N * T, C, H, W)
-        qkv = self.qkv_linear.forward(x_flattened)
-        q, k, v = qkv.chunk(3, dim=1)  # 沿着指定的维度分割成3个块 (80,64,64,64)
-
-        # STEP 2: region-to-region routing
-        # NOTE: ceil_mode=True, count_include_pad=False = auto padding
-        # NOTE: gradients backward through token-to-token attention. See Appendix A for the intuition.
-        q_r = F.avg_pool2d(q.detach(), kernel_size=region_size, ceil_mode=True,
-                           count_include_pad=False)  # detach()：拷贝一份张量，但不影响原始张量  avg_pool2d：平均池化
-        k_r = F.avg_pool2d(k.detach(), kernel_size=region_size, ceil_mode=True,
-                           count_include_pad=False)  # (80,64,64,64)=>(80,64,8,8)
-        q_r: Tensor = q_r.permute(0, 2, 3, 1).flatten(1, 2)  # =>(80,8,8,64)=>(80,64,64)   n(hw)c
-        k_r: Tensor = k_r.flatten(2, 3)  # nc(hw)  =>(80,64,64)
-        a_r = q_r @ k_r  # n(hw)(hw), adj matrix of regional graph  (80,64,64)
-        _, idx_r = torch.topk(a_r, k=self.topk, dim=-1)  # n(hw)k  =>(80,64,4)  # 只获取qi*ki值前top4的注意力信息
-        idx_r: LongTensor = idx_r.unsqueeze_(1).expand(-1, self.num_heads, -1, -1)  # =>(80,1,64,4)=>(80,8,64,4)
-
-        # STEP 3: token to token attention (non-parametric function)
-        output, attn_mat = self.attn_fn(query=q, key=k, value=v, scale=self.scale,
-                                        region_graph=idx_r, region_size=region_size)
-
-        output = output + self.lepe(v)  # ncHW
-        output = self.output_linear(output)  # ncHW
-
-        # 恢复形状
-        output = output.view(N, T, C, H, W)
-
-        if ret_attn_mask:
-            return output, attn_mat
-
-        return output
-
-
 class InpaintGenerator(BaseNetwork):
     def __init__(self, init_weights=True):
         super(InpaintGenerator, self).__init__()
@@ -410,28 +155,17 @@ class InpaintGenerator(BaseNetwork):
         output_size = (60, 108)
         blocks = []
         dropout = 0.
+        t2t_params = {'kernel_size': kernel_size, 'stride': stride, 'padding': padding, 'output_size': output_size}
         n_vecs = 1
         for i, d in enumerate(kernel_size):
             n_vecs *= int((output_size[i] + 2 * padding[i] - (d - 1) - 1) / stride[i] + 1)
-        for i in range(4):
-            stage = nn.Sequential(
-                *[Block(dim=embed_dim[i],  # * 代表传入参数是多个
-                        topk=topks[i],  # topks=[1, 4, 16, -2]
-                        num_heads=nheads[i],
-                        n_win=n_win,
-                        qk_dim=qk_dims[i],
-                        qk_scale=qk_scale,
-                        mlp_ratio=mlp_ratios[i],
-                        mlp_dwconv=mlp_dwconv,
-                        side_dwconv=side_dwconv,
-                        before_attn_dwconv=before_attn_dwconv,
-                        pre_norm=pre_norm,
-                        auto_pad=auto_pad) for j in range(depth[i])],  # 注意这里有一个遍历depth的操作 [4, 4, 18, 4]
-            )
+        for _ in range(stack_num):
+            blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
+                                           t2t_params=t2t_params))
         self.transformer = nn.Sequential(*blocks)  # 在 nn.Sequential 中，每个模块的输出会自动成为下一个模块的输入，直到最后一个模块的输出被返回
-        self.ss = SoftSplitNew(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
-        # self.add_pos_emb = AddPosEmb(n_vecs, hidden)  # n_vecs:720
-        self.sc = SoftCompNew(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
+        self.add_pos_emb = AddPosEmb(n_vecs, hidden)  # n_vecs:720
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
 
         self.encoder = Encoder()
 
@@ -532,8 +266,7 @@ class SoftSplit(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, b):
-        feat = self.t2t(
-            x)  # 卷积截取后展平（特征图中2*2的一个区域就变成了一个一维向量）x:([16, 128, 60, 108]) feat:([16, 6272, 720])  # 这里能变成720就是对的
+        feat = self.t2t(x)  # 卷积截取后展平（特征图中2*2的一个区域就变成了一个一维向量）x:([16, 128, 60, 108]) feat:([16, 6272, 720])  # 这里能变成720就是对的
         feat = feat.permute(0, 2, 1)  # 交换顺序后，所有2*2小格的第i(1,2,3,4)个格子的元素就保存在一个向量中了 feat:([16, 720, 6272])
         feat = self.embedding(feat)  # 将这些向量生维到512 feat:([16, 720, 512])
         feat = feat.view(b, -1, feat.size(2))  # feat:([8, 1440, 512])  (b,?,c)
@@ -548,7 +281,7 @@ class SoftSplitNew(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        self.t2t = nn.Unfold(kernel_size=kernel_size, stride=stride, padding=padding)
+        self.t2t = nn.Unfold(kernel_size=kernel_size,stride=stride,padding=padding)
         c_in = reduce((lambda x, y: x * y), kernel_size) * channel
         self.embedding = nn.Linear(c_in, hidden)
 
@@ -603,8 +336,7 @@ class SoftCompNew(nn.Module):
         feat = self.embedding(x)  # (1,6480,512)=>(1,6480,6272)
         b, _, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)  # (1,6480,6272)=>(9,720,6272)=>(9,6272,720)  (B,?,C)=>(B,C,?)
-        feat = F.fold(feat, output_size=output_size, kernel_size=self.kernel_size, stride=self.stride,
-                      padding=self.padding)
+        feat = F.fold(feat,output_size=output_size, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
         feat = self.bias_conv(feat)
         return feat
 
@@ -683,9 +415,7 @@ class FusionFeedForward(nn.Module):
         # self.fold(...):将多个Patch融合 (16,720,1970)=>(16,1970,720)=>(16,40,60,108)
         # 两个融合后结果做一下归一化
         # self.unfold(...):将归一化后结果再分割成Patch
-        x = self.unfold(self.fold(x.view(-1, self.n_vecs, c).permute(0, 2, 1)) / self.fold(normalizer)).permute(0, 2,
-                                                                                                                1).contiguous().view(
-            b, n, c)
+        x = self.unfold(self.fold(x.view(-1, self.n_vecs, c).permute(0, 2, 1)) / self.fold(normalizer)).permute(0, 2, 1).contiguous().view(b, n, c)
         x = self.conv2(x)  # 还原为输入是形状(8,1440,1960)=>(8,1440,512)
         return x
 
@@ -722,28 +452,22 @@ class Discriminator(BaseNetwork):
         nf = 32
 
         self.conv = nn.Sequential(
-            spectral_norm(
-                nn.Conv3d(in_channels=in_channels, out_channels=nf * 1, kernel_size=(3, 5, 5), stride=(1, 2, 2),
-                          padding=1, bias=not use_spectral_norm), use_spectral_norm),
+            spectral_norm(nn.Conv3d(in_channels=in_channels, out_channels=nf * 1, kernel_size=(3, 5, 5), stride=(1, 2, 2),  padding=1, bias=not use_spectral_norm), use_spectral_norm),
             # nn.InstanceNorm2d(64, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv3d(nf * 1, nf * 2, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2),
-                                    bias=not use_spectral_norm), use_spectral_norm),
+            spectral_norm(nn.Conv3d(nf * 1, nf * 2, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2), bias=not use_spectral_norm), use_spectral_norm),
             # nn.InstanceNorm2d(128, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv3d(nf * 2, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2),
-                                    bias=not use_spectral_norm), use_spectral_norm),
+            spectral_norm(nn.Conv3d(nf * 2, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2), bias=not use_spectral_norm), use_spectral_norm),
             # nn.InstanceNorm2d(256, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2),
-                                    bias=not use_spectral_norm), use_spectral_norm),
+            spectral_norm(nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2), bias=not use_spectral_norm), use_spectral_norm),
             # nn.InstanceNorm2d(256, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2),
-                                    bias=not use_spectral_norm), use_spectral_norm),
+            spectral_norm(nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2), bias=not use_spectral_norm), use_spectral_norm),
             # nn.InstanceNorm2d(256, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2))
+            nn.Conv3d(nf * 4, nf * 4, kernel_size=(3, 5, 5),stride=(1, 2, 2), padding=(1, 2, 2))
         )
 
         if init_weights:
@@ -753,7 +477,7 @@ class Discriminator(BaseNetwork):
         # T, C, H, W = xs.shape
         xs_t = torch.transpose(xs, 0, 1)  # (16,3,240,432)=>(3, 16, 240, 432)
         xs_t = xs_t.unsqueeze(0)  # B, C, T, H, W  (1, 3, 16, 240, 432)
-        feat = self.conv(xs_t)  # feat=(1, 128, 16, 4, 7)
+        feat = self.conv(xs_t)   # feat=(1, 128, 16, 4, 7)
         if self.use_sigmoid:  # use_sigmoid=False
             feat = torch.sigmoid(feat)  # 归一化到0到1之间
         out = torch.transpose(feat, 1, 2)  # B, T, C, H, W   out=(1, 16, 128, 4, 7)
