@@ -3,6 +3,13 @@
   <component name="PublishConfigData" autoUpload="Always" serverName="FuseFormer" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
+      <paths name="BiFormer">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/BiFormer-public_release" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="FuseFormer">
         <serverdata>
           <mappings>

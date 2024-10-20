@@ -16,7 +16,7 @@ from core.dist import (
 )
 
 parser = argparse.ArgumentParser(description='FuseFormer')
-parser.add_argument('-c', '--config', default='configs/youtube-vos.json', type=str)
+parser.add_argument('-c', '--config', default='configs/casia.json', type=str)  # youtube-vos casia
 parser.add_argument('-p', '--port', default='23455', type=str)
 args = parser.parse_args()
 
@@ -67,7 +67,7 @@ if __name__ == "__main__":
     # setup distributed parallel training environments
     if get_master_ip() == "127.0.0.1":
         # manually launch distributed processes 
-        mp.spawn(main_worker, nprocs=config['world_size'], args=(config,))  # 启动config['world_size']个子进程
+        mp.spawn(main_worker, nprocs=config['world_size'], args=(config,))  # 启动torch.cuda.device_count()个子进程
     else:
         # multiple processes have been launched by openmpi 
         config['local_rank'] = get_local_rank()

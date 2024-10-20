@@ -163,9 +163,9 @@ class InpaintGenerator(BaseNetwork):
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
                                            t2t_params=t2t_params))
         self.transformer = nn.Sequential(*blocks)  # 在 nn.Sequential 中，每个模块的输出会自动成为下一个模块的输入，直到最后一个模块的输出被返回
-        self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
-        self.add_pos_emb = AddPosEmb(n_vecs, hidden)
-        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.ss = SoftSplitNew(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
+        self.add_pos_emb = AddPosEmb(n_vecs, hidden)  # n_vecs:720
+        self.sc = SoftCompNew(channel // 2, hidden, output_size, kernel_size, stride, padding)
 
         self.encoder = Encoder()
 
@@ -186,17 +186,21 @@ class InpaintGenerator(BaseNetwork):
     def forward(self, masked_frames):
         # extracting features
         b, t, c, h, w = masked_frames.size()  # b是多少个视频 t是同一视频多少帧  masked_frames:([8, 2, 3, 240, 432])
-        visualize_img(masked_frames.cpu().detach(), "{}/input.png".format("/root/autodl-tmp/FuseFormer-master/visual"))
-        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # enc_feat:([16, 128, 60, 108])
+        # visualize_img(masked_frames.cpu().detach(), "{}/input.png".format("/root/autodl-tmp/FuseFormer-master/visual"))
+        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # enc_feat:([16, 128, 60, 108])  (b*t,c,h,w)
         _, c, h, w = enc_feat.size()
-        trans_feat = self.ss(enc_feat, b)
-        trans_feat = self.add_pos_emb(trans_feat)  # 输入trans_feat([8, 1440, 512])
+
+        trans_feat = self.ss(enc_feat, b)  # 输入(B*T,C,H,W)=>输出(B,T,H,W,C)
+        # trans_feat = self.add_pos_emb(trans_feat)  # 输入trans_feat([8, 1440, 512]) (b,?,c)
+
         trans_feat = self.transformer(trans_feat)  # 输入trans_feat([8, 1440, 512])
-        trans_feat = self.sc(trans_feat, t)  # 输入trans_feat([8, 1440, 512])
+
+        trans_feat = self.sc(trans_feat, t)  # 输入(B,T,H,W,C) 输出(B*T,C,H,W)
+
         enc_feat = enc_feat + trans_feat  # 输入trans_feat([16, 128, 60, 108]) enc_feat:([16, 128, 60, 108])
         output = self.decoder(enc_feat)  # 输入enc_feat:([16, 128, 60, 108])=>([16, 3, 240, 432])
         output = torch.tanh(output)  # tanh 的输出值范围在 -1 和 1 之间  output([16, 3, 240, 432])
-        visualize_img(output.cpu().detach(), "{}/output.png".format("/root/autodl-tmp/FuseFormer-master/visual"))
+        # visualize_img(output.cpu().detach(), "{}/output.png".format("/root/autodl-tmp/FuseFormer-master/visual"))
         return output
 
 
@@ -246,7 +250,7 @@ class AddPosEmb(nn.Module):
 
     def forward(self, x):
         b, n, c = x.size()  # x:([8, 1440, 512])
-        x = x.view(b, -1, self.num_vecs, c)  # x:([8, 2, 720, 512])
+        x = x.view(b, -1, self.num_vecs, c)  # x:([8, 2, 720, 512])  # TODO 这里报错了
         x = x + self.pos_emb  # pos_emb：定义位置嵌入参数，用来提供序列中元素的顺序信息
         x = x.view(b, n, c)  # 再还原回输入时的形状 x:([8, 1440, 512])
         return x
@@ -262,11 +266,37 @@ class SoftSplit(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, b):
-        feat = self.t2t(x)  # 卷积截取后展平（特征图中2*2的一个区域就变成了一个一维向量）x:([16, 128, 60, 108]) feat:([16, 6272, 720])
+        feat = self.t2t(x)  # 卷积截取后展平（特征图中2*2的一个区域就变成了一个一维向量）x:([16, 128, 60, 108]) feat:([16, 6272, 720])  # 这里能变成720就是对的
         feat = feat.permute(0, 2, 1)  # 交换顺序后，所有2*2小格的第i(1,2,3,4)个格子的元素就保存在一个向量中了 feat:([16, 720, 6272])
         feat = self.embedding(feat)  # 将这些向量生维到512 feat:([16, 720, 512])
-        feat = feat.view(b, -1, feat.size(2))  # feat:([8, 1440, 512])
+        feat = feat.view(b, -1, feat.size(2))  # feat:([8, 1440, 512])  (b,?,c)
         feat = self.dropout(feat)
+        return feat
+
+
+# ProPainter的SS，支持输入(B*T,C,H,W)=>输出(B,T,H,W,C)
+class SoftSplitNew(nn.Module):
+    def __init__(self, channel, hidden, kernel_size, stride, padding):
+        super(SoftSplitNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.t2t = nn.Unfold(kernel_size=kernel_size,stride=stride,padding=padding)
+        c_in = reduce((lambda x, y: x * y), kernel_size) * channel
+        self.embedding = nn.Linear(c_in, hidden)
+
+    def forward(self, x, b, output_size):
+        f_h = int((output_size[0] + 2 * self.padding[0] -
+                   (self.kernel_size[0] - 1) - 1) / self.stride[0] + 1)
+        f_w = int((output_size[1] + 2 * self.padding[1] -
+                   (self.kernel_size[1] - 1) - 1) / self.stride[1] + 1)
+
+        feat = self.t2t(x)  # 输入（B*T，C，H，W）=>(b*t,c,?)  (9,128,60,108)=>(9,6272,720)
+        feat = feat.permute(0, 2, 1)  # =>(9,720,6272)  (b*t,?,c)
+        # feat shape [b*t, num_vec, ks*ks*c]
+        feat = self.embedding(feat)  # =>(9,720,512)
+        # feat shape after embedding [b, t*num_vec, hidden]
+        feat = feat.view(b, -1, f_h, f_w, feat.size(2))  # feat(9,720,512)=>(1,9,20,36,512)
         return feat
 
 
@@ -285,6 +315,29 @@ class SoftComp(nn.Module):
         b, n, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)  # t:2,(8,1440,6272)=>(16,720,6272)=>(16,6272,720)
         feat = self.t2t(feat) + self.bias[None]  # (16,128,60,108)+(1,128,60,108)=feat:(16, 128, 60, 108)
+        return feat
+
+
+# ProPainter的SS，支持输入(B,T,H,W,C) 输出(B*T,C,H,W)
+class SoftCompNew(nn.Module):
+    def __init__(self, channel, hidden, kernel_size, stride, padding):
+        super(SoftCompNew, self).__init__()
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        c_out = reduce((lambda x, y: x * y), kernel_size) * channel
+        self.embedding = nn.Linear(hidden, c_out)
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.bias_conv = nn.Conv2d(channel, channel, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x, t, output_size):
+        b_, _, _, _, c_ = x.shape
+        x = x.view(b_, -1, c_)  # 转为（B,?,C） (1,6480,512)
+        feat = self.embedding(x)  # (1,6480,512)=>(1,6480,6272)
+        b, _, c = feat.size()
+        feat = feat.view(b * t, -1, c).permute(0, 2, 1)  # (1,6480,6272)=>(9,720,6272)=>(9,6272,720)  (B,?,C)=>(B,C,?)
+        feat = F.fold(feat,output_size=output_size, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        feat = self.bias_conv(feat)
         return feat
 
 

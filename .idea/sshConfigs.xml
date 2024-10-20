@@ -2,6 +2,7 @@
 <project version="4">
   <component name="SshConfigs">
     <configs>
+      <sshConfig authType="PASSWORD" connectionConfig="{&quot;serverAliveInterval&quot;:300}" host="connect.westb.seetacloud.com" id="9f40f867-7eb7-4fcb-b4b6-c122a2299546" port="32474" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="false" />
       <sshConfig authType="PASSWORD" connectionConfig="{&quot;serverAliveInterval&quot;:300}" host="connect.westb.seetacloud.com" id="13e68f09-cdf2-4813-b2df-f38ee38b5112" port="32474" customName="FuseFormer-Terminal" nameFormat="CUSTOM" username="root" useOpenSSHConfig="false">
         <option name="customName" value="FuseFormer-Terminal" />
       </sshConfig>

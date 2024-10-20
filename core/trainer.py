@@ -38,7 +38,8 @@ class Trainer():
             self.train_dataset,
             batch_size=self.train_args['batch_size'] // config['world_size'],
             shuffle=(self.train_sampler is None),  # 如果train_sampler为空则随机采样，即使用RandomSampler
-            num_workers=self.train_args['num_workers'], 
+            # num_workers:指定了用于数据预处理的子进程数量。更多的num_workers可以加速数据加载，但会增加内存使用(和CPU的核数有关,建议将num_workers设置为CPU核心数减1的值)
+            num_workers=self.train_args['num_workers'],
             sampler=self.train_sampler)
 
         # set loss functions 

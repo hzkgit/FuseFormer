@@ -9,6 +9,9 @@ import matplotlib
 import matplotlib.patches as patches
 from matplotlib.path import Path
 from matplotlib import pyplot as plt
+import cv2
+import torchvision
+from sklearn.metrics import jaccard_score  # 用于计算IoU
 matplotlib.use('agg')
 
 
@@ -192,6 +195,237 @@ def random_move_control_points(X, Y, imageHeight, imageWidth, lineVelocity, regi
     new_X = np.clip(X, 0, imageHeight - region_height)
     new_Y = np.clip(Y, 0, imageWidth - region_width)
     return new_X, new_Y, lineVelocity
+
+
+# 求掩码图A和B的交集和差集
+def paths_to_images(mask_paths, imageHeight=240, imageWidth=432):
+    """将掩码图像路径列表转换为PIL.Image对象列表"""
+    images = []
+    for path in mask_paths:
+        img = Image.open(path)
+        # 如果掩码图像是灰度或二值图像，可以确保其模式为L（8-bit pixels, black and white）
+        if img.mode != 'L':
+            img = img.convert('L')
+        img = img.resize((imageWidth, imageHeight), Image.LANCZOS)
+        images.append(img)
+    return images
+
+
+def convert_image_to_mask(image):
+    """将PIL Image对象转换为黑白掩码"""
+    # 将图像转换为灰度
+    grayscale_image = image.convert('L')
+    # 使用阈值处理，将图像转换为二进制掩码
+    threshold = 128
+    binary_mask = np.array(grayscale_image) > threshold
+    return binary_mask
+
+
+def separate_masks(images_A, images_B):
+    # images_A：随机生成遮挡物掩码
+    # images_B：人体掩码
+    C_indices = []  # 存放与B有交集的A的掩码图像的索引
+    D_indices = []  # 存放与B无交集的A的掩码图像的索引
+    difference_masks = []  # # 合成后的掩码序列
+    B_length = len(images_B)
+
+    # 确保不会越界
+    min_length = min(len(images_A), B_length)
+    for i in range(min_length):
+        bin_maskA = convert_image_to_mask(images_A[i])
+        bin_maskB = convert_image_to_mask(images_B[i])
+
+        # 计算A+B（交集）
+        intersection = np.logical_and(bin_maskA, bin_maskB)
+        # 计算B-A（差集）
+        difference = np.logical_and(bin_maskB, np.logical_not(bin_maskA))
+
+        difference = np.where(difference, 1, 0)  # 将True和False改为1和0
+
+        difference_masks.append(difference)
+
+        if np.any(intersection):
+            C_indices.append(i)
+        else:
+            D_indices.append(i)
+
+    # 处理images_A多出来的部分
+    for i in range(B_length, len(images_A)):
+        D_indices.append(i)
+
+    return C_indices, D_indices, difference_masks
+
+
+#  read frames from video
+def read_frame_from_videos(frame_root):
+    if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
+        video_name = os.path.basename(frame_root)[:-4]
+        vframes, aframes, info = torchvision.io.read_video(filename=frame_root, pts_unit='sec')  # RGB
+        frames = list(vframes.numpy())
+        frames = [Image.fromarray(f) for f in frames]
+        fps = info['video_fps']
+    else:
+        video_name = os.path.basename(frame_root)
+        frames = []
+        fr_lst = sorted(os.listdir(frame_root))
+        for fr in fr_lst:
+            frame = cv2.imread(os.path.join(frame_root, fr))
+            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frames.append(frame)
+        fps = None
+    size = frames[0].size
+
+    return frames, fps, size, video_name
+
+
+def computeIOU(mask1, mask2):
+    # 计算交并集
+    mask1_bool = mask1 > 0
+    mask2_bool = mask2 > 0
+    intersection = np.logical_and(mask1_bool, mask2_bool).astype(int)
+    union = np.logical_or(mask1_bool, mask2_bool).astype(int)
+    iou = np.sum(intersection) / np.sum(union)
+    return iou
+
+
+def bbox_iou(b1, b2):
+    '''
+    b: (x1,y1,x2,y2)
+    '''
+    lx = max(b1[0], b2[0])
+    rx = min(b1[2], b2[2])
+    uy = max(b1[1], b2[1])
+    dy = min(b1[3], b2[3])
+    if rx <= lx or dy <= uy:
+        return 0.
+    else:
+        interArea = (rx-lx)*(dy-uy)
+        a1 = float((b1[2] - b1[0]) * (b1[3] - b1[1]))
+        a2 = float((b2[2] - b2[0]) * (b2[3] - b2[1]))
+        return interArea / (a1 + a2 - interArea)
+
+
+def crop_padding(img, roi, pad_value):
+    '''
+    img: HxW or HxWxC np.ndarray
+    roi: (x,y,w,h)
+    pad_value: [b,g,r]
+    '''
+    need_squeeze = False
+    if len(img.shape) == 2:
+        img = img[:,:,np.newaxis]
+        need_squeeze = True
+    assert len(pad_value) == img.shape[2]
+    x,y,w,h = roi
+    x,y,w,h = int(x),int(y),int(w),int(h)
+    H, W = img.shape[:2]
+    output = np.tile(np.array(pad_value), (h, w, 1)).astype(img.dtype)
+    if bbox_iou((x,y,x+w,y+h), (0,0,W,H)) > 0:
+        output[max(-y,0):min(H-y,h), max(-x,0):min(W-x,w), :] = img[max(y,0):min(y+h,H), max(x,0):min(x+w,W), :]
+    if need_squeeze:
+        output = np.squeeze(output)
+    return output
+
+
+def mask_to_bbox(mask):
+    mask = (mask == 1)
+    # ~表示取反,True=>False,False=>True
+    if np.all(~mask):
+        return [0, 0, 0, 0]
+    assert len(mask.shape) == 2
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]  # 返回了行和列中True值的索引，然后取第一个和最后一个索引作为边界框的起始和结束坐标
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    return [cmin.item(), rmin.item(), cmax.item() + 1 - cmin.item(), rmax.item() + 1 - rmin.item()] # xywh
+
+
+def crop_img(modal):
+    modal = np.array(modal)
+    bbox = mask_to_bbox(modal)
+    # 图像截取
+    centerx = bbox[0] + bbox[2] / 2.  # 中心点x坐标
+    centery = bbox[1] + bbox[3] / 2.  # 中心点y坐标
+    size = max([np.sqrt(bbox[2] * bbox[3] * 3.), bbox[2] * 1.1, bbox[3] * 1.1])
+    new_bbox = [int(centerx - size / 2.), int(centery - size / 2.), int(size), int(size)]
+    modal = cv2.resize(crop_padding(modal, new_bbox, pad_value=(0,)), (320, 320),
+                       interpolation=cv2.INTER_NEAREST)  # 按新的box截取出modal
+    return modal
+
+
+def align2(modal_test, prior_test):
+    # 计算四个端点对齐时的iou
+    modal_temp = modal_test.copy().astype(np.float32)
+    modal_temp[modal_temp == 255] = 1
+    modal_bbox = mask_to_bbox(modal_temp)
+    x, y, w, h = [modal_bbox[0], modal_bbox[1], modal_bbox[2], modal_bbox[3]]
+
+    prior_temp = prior_test.copy().astype(np.float32)
+    prior_temp[prior_temp == 255] = 1
+    prior_bbox = mask_to_bbox(prior_temp)
+    x1, y1, w1, h1 = [prior_bbox[0], prior_bbox[1], prior_bbox[2], prior_bbox[3]]
+
+    modal_temp[modal_temp == 1] = 255
+    prior_temp[prior_temp == 1] = 255
+
+    # 先平移提到(0，0)点
+    prior_temp = cv2.warpAffine(prior_temp, np.float32([[1, 0, -x1], [0, 1, -y1]]),
+                                prior_test.T.shape)  # 这一步出问题了，改成.T就好了
+    iou_arr = np.zeros((2, 2))
+    # 以左上角为准对齐
+    left_top = cv2.warpAffine(prior_temp, np.float32([[1, 0, x], [0, 1, y]]), prior_test.T.shape)
+    iou_arr[0][0] = computeIOU(modal_test, left_top)
+    # 以左下角为准对齐
+    left_down = cv2.warpAffine(prior_temp, np.float32([[1, 0, x], [0, 1, y + h - h1]]), prior_test.T.shape)
+    iou_arr[1][0] = computeIOU(modal_test, left_down)
+    # 以右上角为准对齐
+    right_top = cv2.warpAffine(prior_temp, np.float32([[1, 0, x + w - w1], [0, 1, y]]), prior_test.T.shape)
+    iou_arr[0][1] = computeIOU(modal_test, right_top)
+    # 以右下角为准对齐
+    right_down = cv2.warpAffine(prior_temp, np.float32([[1, 0, x + w - w1], [0, 1, y + h - h1]]), prior_test.T.shape)
+    iou_arr[1][1] = computeIOU(modal_test, right_down)
+
+    # print(iou_arr)
+
+    max_index = np.argmax(iou_arr)
+    row = max_index // iou_arr.shape[1]
+    col = max_index % iou_arr.shape[1]
+
+    # print(f"最大值是{iou_arr[row, col]}，位于第{row + 1}行，第{col + 1}列。")
+
+    if iou_arr[row, col] == iou_arr[0][0]:
+        prior = left_top
+    if iou_arr[row, col] == iou_arr[1][0]:
+        prior = left_down
+    if iou_arr[row, col] == iou_arr[0][1]:
+        prior = right_top
+    if iou_arr[row, col] == iou_arr[1][1]:
+        prior = right_down
+
+    return iou_arr[row, col], prior
+
+
+def match_no_occlusion(occlusion_mask, no_occlusion_masks, num):
+    # 基于jaccard计算相似度并排序（从小到大）
+    mask1_crop = crop_img(occlusion_mask)
+    similarity = []
+    for no_occlusion_mask in no_occlusion_masks:
+        mask_crop = crop_img(no_occlusion_mask)
+        score = jaccard_score(mask1_crop.flatten(), mask_crop.flatten(), average='weighted')
+        similarity.append(score)
+    sorted_indices = np.argsort(similarity)
+    indexes = sorted_indices[::-1][:10]
+
+    # 计算这10个掩码与目标掩码的iou值
+    values = []
+    for j in indexes:
+        no_occlusion_mask = no_occlusion_masks[j]
+        prior = crop_img(no_occlusion_mask)
+        max_value, prior = align2(mask1_crop, prior)  # 计算iou值
+        values.append(max_value)
+    sorted_values_indices = np.argsort(values)
+    index_arr = sorted_values_indices[::-1][:num]
+    return index_arr
 
 
 
