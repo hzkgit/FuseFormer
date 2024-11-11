@@ -6,7 +6,7 @@
         "data_root": "./data",
         "w": 432,
         "h": 240,
-        "sample_length": 5
+        "sample_length": 3
     },
     "losses": {
         "hole_weight": 1,
@@ -15,7 +15,7 @@
         "GAN_LOSS": "hinge"
     },
     "model": {
-        "net": "fuseformer",
+        "net": "fuseformer_backup",
         "no_dis": 0
     },
     "trainer": {
@@ -23,11 +23,11 @@
         "beta1": 0,
         "beta2": 0.99,
         "lr": 1e-4,
-        "batch_size": 8,
+        "batch_size": 2,
         "num_workers": 2,
         "log_freq": 100,
-        "save_freq": 1e4,
-        "iterations": 50e4,
-        "niter": 40e4
+        "save_freq": 1000,
+        "iterations": 5e4,
+        "niter": 4e4
     }
 }

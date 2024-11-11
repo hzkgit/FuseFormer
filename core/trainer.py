@@ -32,7 +32,7 @@ class Trainer():
         if config['distributed']:
             self.train_sampler = DistributedSampler(  # 如果是分布式训练则使用DistributedSampler
                 self.train_dataset,
-                num_replicas=config['world_size'], 
+                num_replicas=config['world_size'],
                 rank=config['global_rank'])
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -56,29 +56,29 @@ class Trainer():
                 in_channels=3, use_sigmoid=config['losses']['GAN_LOSS'] != 'hinge')
             self.netD = self.netD.to(self.config['device'])
         self.optimG = torch.optim.Adam(
-            self.netG.parameters(), 
+            self.netG.parameters(),
             lr=config['trainer']['lr'],
             betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         if not self.config['model']['no_dis']:
             self.optimD = torch.optim.Adam(
-                self.netD.parameters(), 
+                self.netD.parameters(),
                 lr=config['trainer']['lr'],
                 betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         self.load()
 
         if config['distributed']:
             self.netG = DDP(
-                self.netG, 
-                device_ids=[self.config['local_rank']], 
+                self.netG,
+                device_ids=[self.config['local_rank']],
                 output_device=self.config['local_rank'],
-                broadcast_buffers=True, 
+                broadcast_buffers=True,
                 find_unused_parameters=True)
             if not self.config['model']['no_dis']:
                 self.netD = DDP(
-                    self.netD, 
-                    device_ids=[self.config['local_rank']], 
+                    self.netD,
+                    device_ids=[self.config['local_rank']],
                     output_device=self.config['local_rank'],
-                    broadcast_buffers=True, 
+                    broadcast_buffers=True,
                     find_unused_parameters=False)
 
         # set summary writer
@@ -136,8 +136,8 @@ class Trainer():
                 model_path, 'opt_{}.pth'.format(str(latest_epoch).zfill(5)))
             if self.config['global_rank'] == 0:
                 print('Loading model from {}...'.format(gen_path))
-            data = torch.load(gen_path, map_location=self.config['device'])
-            self.netG.load_state_dict(data['netG'])
+            data =torch.load(gen_path, map_location=self.config['device'])
+            self.netG.load_state_dict(data['netG'] if len(data) == 1 else data)
             if not self.config['model']['no_dis']:
                 data = torch.load(dis_path, map_location=self.config['device'])
                 self.netD.load_state_dict(data['netD'])
@@ -197,7 +197,7 @@ class Trainer():
                     datefmt='%a, %d %b %Y %H:%M:%S',
                     filename='logs/{}.log'.format(self.config['save_dir'].split('/')[-1]),
                     filemode='w')
-        
+
         while True:
             self.epoch += 1
             if self.config['distributed']:
@@ -220,8 +220,8 @@ class Trainer():
             b, t, c, h, w = frames.size()
             masked_frame = (frames * (1 - masks).float())  # masked_frame：保留原帧中可见区域，不可见区域全部设为0
             pred_img = self.netG(masked_frame)  # 输入数据到模型
-            frames = frames.view(b*t, c, h, w)  # (16,3,240,432)
-            masks = masks.view(b*t, 1, h, w)
+            frames = frames.view(b*t, c, h, w)  # 转为(B*T,C,H,W)
+            masks = masks.view(b*t, 1, h, w)  # 转为(B*T,C,H,W)
             comp_img = frames*(1.-masks) + masks*pred_img  # frames*(1.-masks)：取原帧中可见部分  masks*pred_img：取预测图中的不可见部分
 
             gen_loss = 0
@@ -249,7 +249,7 @@ class Trainer():
                 self.optimD.step()
 
                 # generator adversarial loss
-                gen_vid_feat = self.netD(comp_img)  # 将合成图输入生成器
+                gen_vid_feat = self.netD(comp_img)  # 将合成图输入判别器
                 gan_loss = self.adversarial_loss(gen_vid_feat, True, False)
                 gan_loss = gan_loss * self.config['losses']['adversarial_weight']
                 gen_loss += gan_loss  # 生成器损失值
@@ -258,7 +258,7 @@ class Trainer():
 
             # generator l1 loss
             hole_loss = self.l1_loss(pred_img*masks, frames*masks)  # 将“预测出的不可见部分”与“原图中真实部分”计算L1损失
-            hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
+            hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']  # torch.mean=所有像素值加起来除以(6*1*240*432) 即计算了masks张量中所有元素的平均值  实际上是计算了掩码中1的比例 当掩码中大部分区域为0时，即大部分样本不参与损失计算时，我们可以避免这些样本对总损失的过度影响
             gen_loss += hole_loss  # 预测结果与真实结果间的损失值
             self.add_summary(
                 self.gen_writer, 'loss/hole_loss', hole_loss.item())
@@ -268,7 +268,7 @@ class Trainer():
             gen_loss += valid_loss  # 预测结果（可见部分）与真实结果间的损失值
             self.add_summary(
                 self.gen_writer, 'loss/valid_loss', valid_loss.item())
-            
+
             self.optimG.zero_grad()
             gen_loss.backward()
             self.optimG.step()  # 更新生成器的参数

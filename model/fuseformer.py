@@ -126,12 +126,55 @@ class DWConv(nn.Module):
         return x
 
 
+class FusionFeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim=1960, t2t_params=None):
+        super(FusionFeedForward, self).__init__()
+        # We set hidden_dim as a default to 1960
+        self.fc1 = nn.Sequential(nn.Linear(dim, hidden_dim))
+        self.fc2 = nn.Sequential(nn.GELU(), nn.Linear(hidden_dim, dim))
+        assert t2t_params is not None
+        self.t2t_params = t2t_params
+        self.kernel_shape = reduce((lambda x, y: x * y), t2t_params['kernel_size'])  # 49
+
+    def forward(self, x, output_size):
+        n_vecs = 1
+        for i, d in enumerate(self.t2t_params['kernel_size']):
+            n_vecs *= int((output_size[i] + 2 * self.t2t_params['padding'][i] -
+                           (d - 1) - 1) / self.t2t_params['stride'][i] + 1)
+
+        B, T, H, W, C = x.shape
+        x = x.view(B, T * H * W, C)
+        x = self.fc1(x)  # 512=>1960
+        b, n, c = x.size()
+        normalizer = x.new_ones(b, n, self.kernel_shape).view(-1, n_vecs, self.kernel_shape).permute(0, 2, 1)
+        normalizer = F.fold(normalizer,
+                            output_size=output_size,
+                            kernel_size=self.t2t_params['kernel_size'],
+                            padding=self.t2t_params['padding'],
+                            stride=self.t2t_params['stride'])
+
+        x = F.fold(x.view(-1, n_vecs, c).permute(0, 2, 1),
+                   output_size=output_size,
+                   kernel_size=self.t2t_params['kernel_size'],
+                   padding=self.t2t_params['padding'],
+                   stride=self.t2t_params['stride'])
+
+        x = F.unfold(x / normalizer,
+                     kernel_size=self.t2t_params['kernel_size'],
+                     padding=self.t2t_params['padding'],
+                     stride=self.t2t_params['stride']).permute(
+                         0, 2, 1).contiguous().view(b, n, c)
+        x = self.fc2(x)  # (2，3600，512)
+        x = x.view(B, T, H, W, C)
+        return x
+
+
 class Block(nn.Module):
     def __init__(self, dim, drop_path=0.,
                  num_heads=8, n_win=7, qk_dim=None, qk_scale=None,
                  topk=4,
                  mlp_ratio=4, mlp_dwconv=False,
-                 side_dwconv=5, before_attn_dwconv=3, pre_norm=True, auto_pad=False):
+                 side_dwconv=5, before_attn_dwconv=3, pre_norm=True, auto_pad=False, t2t_params=None):
         super().__init__()
         qk_dim = qk_dim or dim
 
@@ -141,34 +184,35 @@ class Block(nn.Module):
         else:
             self.pos_embed = lambda x: 0
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)  # important to avoid attention collapsing
-        if topk > 0:
-            self.attn = BiLevelRoutingAttention_nchw(dim=dim, num_heads=num_heads, n_win=n_win,
-                                                     qk_scale=qk_scale,
-                                                     topk=topk,
-                                                     side_dwconv=side_dwconv,
-                                                     auto_pad=auto_pad)
+        self.attn = BiLevelRoutingAttention_nchw(dim=dim, num_heads=num_heads, n_win=n_win,
+                                                 qk_scale=qk_scale,
+                                                 topk=topk,
+                                                 side_dwconv=side_dwconv,
+                                                 auto_pad=auto_pad)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = nn.Sequential(nn.Linear(dim, int(mlp_ratio * dim)),
-                                 DWConv(int(mlp_ratio * dim)) if mlp_dwconv else nn.Identity(),
-                                 nn.GELU(),
-                                 nn.Linear(int(mlp_ratio * dim), dim)
-                                 )
+        # self.mlp = nn.Sequential(nn.Linear(dim, int(mlp_ratio * dim)),
+        #                          DWConv(int(mlp_ratio * dim)) if mlp_dwconv else nn.Identity(),
+        #                          nn.GELU(),
+        #                          nn.Linear(int(mlp_ratio * dim), dim)
+        #                          )
+        self.mlp = FusionFeedForward(dim, t2t_params=t2t_params)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()  # 随机断开（或丢弃）网络中的路径，这有助于防止过拟合并提高模型泛化能力
         self.use_layer_scale = False
         self.pre_norm = pre_norm
 
-    def forward(self, x):
+    def forward(self, inputs):
         """
         x: NCHW tensor
         """
         # conv pos embedding
-        x = x + self.pos_embed(x)  # 注意力0层,(16,64,56,56)+(16,64,56,56)=>(16,64,56,56)
-        # permute to NHWC tensor for attention & mlp
-        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
-        x = x + self.drop_path(self.attn(self.norm1(x)))  # (N, H, W, C)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))  # (N, H, W, C)  # 输入x:(16,56,56,64) 经过一次层归一化、经过一个2层全连接得到x:(16,56,56,64)
-        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)  # =>(16,64,56,56)
-        return x
+        x, fold_x_size = inputs
+        b, t, h, w, c = x.size()
+        x = x.view(b * t, c, h, w)  # pos_embed需要输入为（n,c,h,w）形状，所以要变形
+        x = x + self.pos_embed(x)
+        x = x.view(b, t, x.shape[2], x.shape[3], x.shape[1])  # =>(b,t,h,w,c),为了Norm所以要把C放最后
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x), fold_x_size))  # 输出(2，3600，512)
+        return x, fold_x_size
 
 
 def _grid2seq(x: Tensor, region_size: Tuple[int], num_heads: int):
@@ -327,11 +371,11 @@ class BiLevelRoutingAttention_nchw(nn.Module):
         Return:
             NCHW tensor
         """
-        N, T, C, H, W = x.size()
+        N, T, H, W, C = x.size()
         region_size = (H // self.n_win, W // self.n_win)  # (64/7,64/7)=(9,9)
 
         # STEP 1: linear projection
-        x_flattened = x.view(N * T, C, H, W)
+        x_flattened = x.view(N * T, C, H, W)  # TODO 这里就不对，把不同批次的混在一起了
         qkv = self.qkv_linear.forward(x_flattened)
         q, k, v = qkv.chunk(3, dim=1)  # 沿着指定的维度分割成3个块 (80,64,64,64)
 
@@ -356,7 +400,7 @@ class BiLevelRoutingAttention_nchw(nn.Module):
         output = self.output_linear(output)  # ncHW
 
         # 恢复形状
-        output = output.view(N, T, C, H, W)
+        output = output.view(N, T, H, W, C)
 
         if ret_attn_mask:
             return output, attn_mat
@@ -367,48 +411,54 @@ class BiLevelRoutingAttention_nchw(nn.Module):
 class InpaintGenerator(BaseNetwork):
     def __init__(self, init_weights=True):
         super(InpaintGenerator, self).__init__()
-        channel = 256
+        channel = 128
         hidden = 512
         stack_num = 8
         num_head = 4
         kernel_size = (7, 7)
         padding = (3, 3)
         stride = (3, 3)
+        t2t_params = {
+            'kernel_size': kernel_size,
+            'stride': stride,
+            'padding': padding
+        }
         output_size = (60, 108)
         blocks = []
         dropout = 0.
         n_vecs = 1
 
         # 新增
-        depth = [4, 4, 18, 4],
-        embed_dim = [64, 128, 256, 512],
-        mlp_ratios = [3, 3, 3, 3],
-        n_win = 7,
-        # kv_downsample_mode = 'identity',
-        # kv_per_wins = [-1, -1, -1, -1],
-        topks = [1, 4, 16, -2],
-        side_dwconv = 5,
-        before_attn_dwconv = 3,
-        # layer_scale_init_value = -1,
-        qk_dims = [64, 128, 256, 512],
-        # head_dim = 32,
-        # param_routing = False,
-        # diff_routing = False,
-        # soft_routing = False,
-        pre_norm = True,
-        # pe = None,
-        mlp_dwconv = False,
-        qk_scale = None,
-        head_dim = 64,
-        auto_pad = False,
-        drop_path_rate = 0.,
+        depth = [8]
+        embed_dim = [512]
+        mlp_ratios = [3]
+        n_win = 7
+        # kv_downsample_mode = 'identity'
+        # kv_per_wins = [-1, -1, -1, -1]
+        topks = [4]
+        side_dwconv = 5
+        before_attn_dwconv = 3
+        # layer_scale_init_value = -1
+        qk_dims = [512]
+        # head_dim = 32
+        # param_routing = False
+        # diff_routing = False
+        # soft_routing = False
+        pre_norm = True
+        # pe = None
+        mlp_dwconv = False
+        qk_scale = None
+        head_dim = 64
+        auto_pad = False
+        drop_path_rate = 0.
         nheads = [dim // head_dim for dim in qk_dims]
+        self.stages = nn.ModuleList()
 
         for i, d in enumerate(kernel_size):
             n_vecs *= int((output_size[i] + 2 * padding[i] - (d - 1) - 1) / stride[i] + 1)
         dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depth))]
         cur = 0
-        for i in range(4):
+        for i in range(1):
             stage = nn.Sequential(
                 *[Block(dim=embed_dim[i],  # * 代表传入参数是多个
                         drop_path=dp_rates[cur + j],
@@ -422,18 +472,19 @@ class InpaintGenerator(BaseNetwork):
                         side_dwconv=side_dwconv,
                         before_attn_dwconv=before_attn_dwconv,
                         pre_norm=pre_norm,
-                        auto_pad=auto_pad) for j in range(depth[i])],  # 注意这里有一个遍历depth的操作 [4, 4, 18, 4]
+                        auto_pad=auto_pad,
+                        t2t_params=t2t_params) for j in range(depth[i])],
             )
-            self.stages.append(stage)
+            self.stages = stage
             cur += depth[i]
         self.transformer = nn.Sequential(*blocks)  # 在 nn.Sequential 中，每个模块的输出会自动成为下一个模块的输入，直到最后一个模块的输出被返回
-        self.ss = SoftSplitNew(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
-        self.sc = SoftCompNew(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.ss = SoftSplitNew(channel, hidden, kernel_size, stride, padding)
+        self.sc = SoftCompNew(channel, hidden, kernel_size, stride, padding)
         self.encoder = Encoder()
 
         # decoder: decode frames from features
         self.decoder = nn.Sequential(
-            deconv(channel // 2, 128, kernel_size=3, padding=1),
+            deconv(channel, 128, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -447,18 +498,21 @@ class InpaintGenerator(BaseNetwork):
 
     def forward(self, masked_frames):
         # extracting features
-        b, t, c, h, w = masked_frames.size()  # b是多少个视频 t是同一视频多少帧  masked_frames:([8, 2, 3, 240, 432])
-        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # enc_feat:([16, 128, 60, 108])  (b*t,c,h,w)
-        _, c, h, w = enc_feat.size()
+        b, t, c, h, w = masked_frames.size()  # masked_frames:(2,5,3,240,432)
+        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # 输入(b*t,c,h,w)、输出(b*t,c,h,w) (10,128,60,108)
+        _, c_new, h_new, w_new = enc_feat.size()
+        fold_feat_size = (h_new, w_new)
 
-        trans_feat = self.ss(enc_feat, b)  # 输入(B*T,C,H,W)=>输出(B,T,H,W,C)
-        for i in range(4):  # 通过4个Transformer模块
-            trans_feat = self.stages[i](trans_feat)
-        trans_feat = self.sc(trans_feat, t)  # 输入(B,T,H,W,C) 输出(B*T,C,H,W)
+        trans_feat = self.ss(enc_feat, b, fold_feat_size)  # 输入(B*T,C,H,W)=>输出(B,T,H,W,C) (2,5,20,36,512) 软分割
 
-        enc_feat = enc_feat + trans_feat  # 输入trans_feat([16, 128, 60, 108]) enc_feat:([16, 128, 60, 108])
+        trans_feat = self.stages((trans_feat, fold_feat_size))  # 输入(B,T,H,W,C) 输出() 使用nn.Sequential()定义的网络，只接受单输入,否则会报错
+
+        trans_feat = self.sc(trans_feat[0], t, fold_feat_size)  # 输入(B,T,H,W,C) 输出(B*T,C,H,W)
+
+        enc_feat = enc_feat + trans_feat  # 输入trans_feat([16, 128, 60, 108]) enc_feat:([16, 128, 60, 108]) (10,128,60,108)
         output = self.decoder(enc_feat)  # 输入enc_feat:([16, 128, 60, 108])=>([16, 3, 240, 432])
-        output = torch.tanh(output)  # tanh 的输出值范围在 -1 和 1 之间  output([16, 3, 240, 432])
+
+        output = torch.tanh(output)  # tanh 的输出值范围在 -1 和 1 之间  output([16, 3, 240, 432])  (B*T,C,H,W)
         return output
 
 
@@ -472,46 +526,6 @@ class deconv(nn.Module):
         x = F.interpolate(x, scale_factor=2, mode='bilinear',
                           align_corners=True)
         return self.conv(x)
-
-
-# #############################################################################
-# ############################# Transformer  ##################################
-# #############################################################################
-
-
-class Attention(nn.Module):
-    """
-    Compute 'Scaled Dot Product Attention
-    """
-
-    def __init__(self, p=0.1):
-        super(Attention, self).__init__()
-        self.dropout = nn.Dropout(p=p)
-
-    def forward(self, query, key, value, m=None):
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))
-        if m is not None:
-            scores.masked_fill_(m, -1e9)
-        p_attn = F.softmax(scores, dim=-1)
-        p_attn = self.dropout(p_attn)
-        p_val = torch.matmul(p_attn, value)
-        return p_val, p_attn
-
-
-class AddPosEmb(nn.Module):
-    def __init__(self, n, c):
-        super(AddPosEmb, self).__init__()
-        # 使用正态分布初始化位置嵌入参数，而不是直接使用序号
-        # https://www.tiangong.cn/result/24e8e7bc-1a76-4ecc-a8bc-a9acca7f41cc
-        self.pos_emb = nn.Parameter(torch.zeros(1, 1, n, c).float().normal_(mean=0, std=0.02), requires_grad=True)
-        self.num_vecs = n  # 720
-
-    def forward(self, x):
-        b, n, c = x.size()  # x:([8, 1440, 512])
-        x = x.view(b, -1, self.num_vecs, c)  # x:([8, 2, 720, 512])  # TODO 这里报错了
-        x = x + self.pos_emb  # pos_emb：定义位置嵌入参数，用来提供序列中元素的顺序信息
-        x = x.view(b, n, c)  # 再还原回输入时的形状 x:([8, 1440, 512])
-        return x
 
 
 class SoftSplit(nn.Module):
@@ -598,113 +612,7 @@ class SoftCompNew(nn.Module):
         feat = F.fold(feat, output_size=output_size, kernel_size=self.kernel_size, stride=self.stride,
                       padding=self.padding)
         feat = self.bias_conv(feat)
-        return feat
-
-
-class MultiHeadedAttention(nn.Module):
-    """
-    Take in model size and number of heads.
-    """
-
-    def __init__(self, d_model, head, p=0.1):
-        super().__init__()
-        self.query_embedding = nn.Linear(d_model, d_model)
-        self.value_embedding = nn.Linear(d_model, d_model)
-        self.key_embedding = nn.Linear(d_model, d_model)
-        self.output_linear = nn.Linear(d_model, d_model)  # nn.Linear:全连接层
-        self.attention = Attention(p=p)
-        self.head = head
-
-    def forward(self, x):
-        b, n, c = x.size()  # x=(8,1440,512)
-        c_h = c // self.head  # c_h=512/4=128
-        key = self.key_embedding(x)  # key=(8,1440,512)
-        key = key.view(b, n, self.head, c_h).permute(0, 2, 1, 3)  # (8,1440,4,128)=>(8,4,1440,128)
-        query = self.query_embedding(x)  # query=(8,1440,512)
-        query = query.view(b, n, self.head, c_h).permute(0, 2, 1, 3)  # (8,4,1440,128)
-        value = self.value_embedding(x)
-        value = value.view(b, n, self.head, c_h).permute(0, 2, 1, 3)  # (8,4,1440,128)
-        att, _ = self.attention(query, key, value)  # att=(8,4,1440,128)
-        att = att.permute(0, 2, 1, 3).contiguous().view(b, n, c)  # (8,1440,4,128)=>(8,1440,512)
-        output = self.output_linear(att)  # output=(8,1440,512)
-        return output
-
-
-class FeedForward(nn.Module):
-    def __init__(self, d_model, p=0.1):
-        super(FeedForward, self).__init__()
-        # We set d_ff as a default to 2048
-        self.conv = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=p),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(p=p))
-
-    def forward(self, x):
-        x = self.conv(x)
-        return x
-
-
-class FusionFeedForward(nn.Module):
-    def __init__(self, d_model, p=0.1, n_vecs=None, t2t_params=None):
-        super(FusionFeedForward, self).__init__()
-        # We set d_ff as a default to 1960
-        hd = 1960
-        self.conv1 = nn.Sequential(
-            nn.Linear(d_model, hd))  # Sequential((0): Linear(in_features=512, out_features=1960, bias=True))
-        self.conv2 = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=p),
-            nn.Linear(hd, d_model),
-            nn.Dropout(p=p))
-        assert t2t_params is not None and n_vecs is not None
-        tp = t2t_params.copy()
-        self.fold = nn.Fold(**tp)
-        del tp['output_size']
-        self.unfold = nn.Unfold(**tp)
-        self.n_vecs = n_vecs
-
-    def forward(self, x):
-        x = self.conv1(x)  # (8,1440,512)=>(8,1440,1960) torch.nn.Linear层默认应用于输入张量的最后一个维度
-        b, n, c = x.size()
-        # new_ones:快速创建一个全1的张量 (8,1440,49)=>(16,720,49)=>(16,49,720) 这个是为了归一化用的
-        normalizer = x.new_ones(b, n, 49).view(-1, self.n_vecs, 49).permute(0, 2, 1)
-        # self.fold(output_size=(60, 108), kernel_size=(7, 7), dilation=1(无空洞,如果dilation大于1，则在卷积核元素之间会插入零), padding=(3, 3), stride=(3, 3)):
-        # self.fold(normalizer):将多个Patch融合 (16,49,720)=>(16,1,60,108)
-        # self.fold(...):将多个Patch融合 (16,720,1970)=>(16,1970,720)=>(16,40,60,108)
-        # 两个融合后结果做一下归一化
-        # self.unfold(...):将归一化后结果再分割成Patch
-        x = self.unfold(self.fold(x.view(-1, self.n_vecs, c).permute(0, 2, 1)) / self.fold(normalizer)).permute(0, 2,
-                                                                                                                1).contiguous().view(
-            b, n, c)
-        x = self.conv2(x)  # 还原为输入是形状(8,1440,1960)=>(8,1440,512)
-        return x
-
-
-class TransformerBlock(nn.Module):
-    """
-    Transformer = MultiHead_Attention + Feed_Forward with sublayer connection
-    """
-
-    def __init__(self, hidden=128, num_head=4, dropout=0.1, n_vecs=None, t2t_params=None):
-        super().__init__()
-        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
-        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
-        self.norm1 = nn.LayerNorm(hidden)  # 层归一化，一种批量归一化技术
-        self.norm2 = nn.LayerNorm(hidden)
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, input):
-        x = self.norm1(input)  # x:([8, 1440, 512])  层归一化 （8个批次，每个批次1440个token，每个token长度为512）
-        x = input + self.dropout(self.attention(x))  # 多头注意力
-        y = self.norm2(x)  # 输入x:(8,1440,512)
-        x = x + self.ffn(y)  # x:(8,1440,512)+y:(8,1440,512)=>x:(8,1440,512)
-        return x
-
-
-# ######################################################################
-# ######################################################################
+        return feat  # (10,128,60,108)
 
 
 class Discriminator(BaseNetwork):

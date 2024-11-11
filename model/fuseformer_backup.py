@@ -193,7 +193,7 @@ class InpaintGenerator(BaseNetwork):
         trans_feat = self.ss(enc_feat, b)  # 输入(B*T,C,H,W)=>输出(B,T,H,W,C)
         # trans_feat = self.add_pos_emb(trans_feat)  # 输入trans_feat([8, 1440, 512]) (b,?,c)
 
-        trans_feat = self.transformer(trans_feat)  # 输入trans_feat([8, 1440, 512])
+        trans_feat = self.transformer(trans_feat)  # 输入trans_feat([8, 1440, 512])  本地测试这里由于GPU显存不足进行不下去
 
         trans_feat = self.sc(trans_feat, t)  # 输入(B,T,H,W,C) 输出(B*T,C,H,W)
 
@@ -231,7 +231,7 @@ class Attention(nn.Module):
         self.dropout = nn.Dropout(p=p)
 
     def forward(self, query, key, value, m=None):
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))  # 本地测试这里由于GPU显存不足进行不下去
         if m is not None:
             scores.masked_fill_(m, -1e9)
         p_attn = F.softmax(scores, dim=-1)
@@ -364,7 +364,7 @@ class MultiHeadedAttention(nn.Module):
         query = query.view(b, n, self.head, c_h).permute(0, 2, 1, 3)  # (8,4,1440,128)
         value = self.value_embedding(x)
         value = value.view(b, n, self.head, c_h).permute(0, 2, 1, 3)  # (8,4,1440,128)
-        att, _ = self.attention(query, key, value)  # att=(8,4,1440,128)
+        att, _ = self.attention(query, key, value)  # att=(8,4,1440,128)  本地测试这里由于GPU显存不足进行不下去
         att = att.permute(0, 2, 1, 3).contiguous().view(b, n, c)  # (8,1440,4,128)=>(8,1440,512)
         output = self.output_linear(att)  # output=(8,1440,512)
         return output
@@ -435,7 +435,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, input):
         x = self.norm1(input)  # x:([8, 1440, 512])  层归一化 （8个批次，每个批次1440个token，每个token长度为512）
-        x = input + self.dropout(self.attention(x))  # 多头注意力
+        x = input + self.dropout(self.attention(x))  # 多头注意力  本地测试这里由于GPU显存不足进行不下去
         y = self.norm2(x)  # 输入x:(8,1440,512)
         x = x + self.ffn(y)  # x:(8,1440,512)+y:(8,1440,512)=>x:(8,1440,512)
         return x

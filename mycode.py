@@ -72,14 +72,61 @@ if __name__ == '__main__':
     # print(reconstructed_image)
     # print(f'Reconstructed Image Size: {reconstructed_image.size()}')  # (1,1,5,5)
 
-    x = torch.Tensor([[[[1, 2, 3, 4],
-                        [5, 6, 7, 8],
-                        [9, 10, 11, 12],
-                        [13, 14, 15, 16]]]])
-    unfold = nn.Unfold(kernel_size=(2, 2), padding=0, stride=2)
-    fold = nn.Fold(output_size=(3, 3), kernel_size=(2, 2), padding=0, stride=1)
-    x = unfold(x)
-    print(x)
-    x = fold(x)
-    print(x)
-    print(x.size())
+    # x = torch.Tensor([[[[1, 2, 3, 4],
+    #                     [5, 6, 7, 8],
+    #                     [9, 10, 11, 12],
+    #                     [13, 14, 15, 16]]]])
+    # unfold = nn.Unfold(kernel_size=(2, 2), padding=0, stride=2)
+    # fold = nn.Fold(output_size=(3, 3), kernel_size=(2, 2), padding=0, stride=1)
+    # x = unfold(x)
+    # print(x)
+    # x = fold(x)
+    # print(x)
+    # print(x.size())
+
+    # import torch
+    #
+    # net = torch.load('checkpoints/fuseformer.pth')
+    # print(net)
+    # print(type(net))
+    # print(len(net))
+    # for k in net.keys():
+    #     print(k)
+    # for key, value in net["model"].items():
+    #     print(key, value.size(), sep=" ")
+
+    import cv2
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    # import matplotlib
+    # matplotlib.use('TkAgg')
+    from PIL import Image
+    import torchvision.transforms as transforms
+
+    # 读取RGB图像
+    # image = cv2.imread('imgs/test.jpg')
+    # # OpenCV读取的图像格式是BGR，需要转换为RGB
+    # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # x = torch.Tensor([[[[1, 2, 3, 4],
+    #                     [5, 6, 7, 8],
+    #                     [9, 10, 11, 12],
+    #                     [13, 14, 15, 16]]]])
+    # temp = x.numpy()[0][0]
+    # img_pil = Image.fromarray(np.uint8(temp))
+    # # 显示图像
+    # plt.imshow(img_pil)
+    # plt.show()
+
+    image = Image.open('imgs/test.jpg')
+    img_tensor = torch.as_tensor(np.array(image))
+    if img_tensor.shape[0] == 1:
+        # 如果是单通道图像，复制通道3次变为RGB（这里是一种简单的处理方式，可能不适用于所有情况）
+        img_tensor = img_tensor.repeat(1, 1, 3)
+    image = transforms.ToPILImage()(img_tensor.permute(2, 0, 1))
+    # # 显示图像
+    current_backend = plt.get_backend()
+    plt.imshow(image)  # (C,H,W)
+    plt.axis('off')
+    plt.show()
